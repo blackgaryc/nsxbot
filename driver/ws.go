@@ -24,12 +24,18 @@ import (
 // ws onebot await echo message time out
 var EchoTimeOut = 5 * time.Second
 
-type echoStore struct {
+type EchoStore struct {
 	mu    sync.RWMutex
 	echos map[int64]chan Response[json.RawMessage]
 }
 
-func (e *echoStore) Receive(selfId int64, data []byte) error {
+func NewEchoStore() *EchoStore {
+	return &EchoStore{
+		echos: make(map[int64]chan Response[json.RawMessage]),
+	}
+}
+
+func (e *EchoStore) Receive(selfId int64, data []byte) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	echoChan, ok := e.echos[selfId]
@@ -44,7 +50,7 @@ func (e *echoStore) Receive(selfId int64, data []byte) error {
 	return nil
 }
 
-func (e *echoStore) Get(selfId int64) chan Response[json.RawMessage] {
+func (e *EchoStore) Get(selfId int64) chan Response[json.RawMessage] {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	echoChan, ok := e.echos[selfId]
@@ -63,7 +69,7 @@ type WSnode struct {
 
 type WSClient struct {
 	*WSEmittersMux
-	echoStore  *echoStore
+	echoStore  *EchoStore
 	nodes      []WSnode
 	log        *slog.Logger
 	retryDelay time.Duration
@@ -76,9 +82,7 @@ func NewWSClient(retryDelay time.Duration, nodes ...WSnode) *WSClient {
 			connectCallbacks: make(map[int64]func(Emitter)),
 			log:              nlog.Logger(),
 		},
-		echoStore: &echoStore{
-			echos: make(map[int64]chan Response[json.RawMessage]),
-		},
+		echoStore:  NewEchoStore(),
 		nodes:      nodes,
 		log:        nlog.Logger(),
 		retryDelay: retryDelay,
@@ -155,7 +159,7 @@ func (ws *WSClient) Listen(ctx context.Context, eventChan chan<- event.Event) er
 
 type WServer struct {
 	*WSEmittersMux
-	echoStore *echoStore
+	echoStore *EchoStore
 	url       url.URL
 	token     string
 	log       *slog.Logger
@@ -176,9 +180,7 @@ func NewWSverver(host string, path string, opts ...WServerOption) *WServer {
 			connectCallbacks: make(map[int64]func(Emitter)),
 			log:              nlog.Logger(),
 		},
-		echoStore: &echoStore{
-			echos: make(map[int64]chan Response[json.RawMessage]),
-		},
+		echoStore: NewEchoStore(),
 		url: url.URL{
 			Scheme: "ws",
 			Host:   host,
@@ -520,20 +522,7 @@ func (e *EmitterWS) Raw(ctx context.Context, action Action, params any) ([]byte,
 		return nil, err
 	}
 	e.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, EchoTimeOut)
-	defer cancel()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case echo := <-e.echo:
-			if !strings.EqualFold(echoId, echo.Echo) {
-				e.echo <- echo
-				continue
-			}
-			return json.Marshal(echo)
-		}
-	}
+	return wsWaitRaw(ctx, echoId, e.echo)
 }
 
 func wsAction[P any](conn *websocket.Conn, action string, params P) (string, error) {
@@ -543,6 +532,26 @@ func wsAction[P any](conn *websocket.Conn, action string, params P) (string, err
 		Echo:   echoid,
 		Params: params,
 	})
+}
+
+func wsWaitRaw(ctx context.Context, echoId string, echoChan chan Response[json.RawMessage]) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, EchoTimeOut)
+	defer cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case echo := <-echoChan:
+			if !strings.EqualFold(echoId, echo.Echo) {
+				echoChan <- echo
+				continue
+			}
+			if strings.EqualFold("failed", echo.Status) {
+				return nil, fmt.Errorf("action failed, status: %s", echo.Status)
+			}
+			return json.Marshal(echo)
+		}
+	}
 }
 
 func wsWait[R any](ctx context.Context, echoId string, echoChan chan Response[json.RawMessage]) (*R, error) {
@@ -558,7 +567,7 @@ func wsWait[R any](ctx context.Context, echoId string, echoChan chan Response[js
 				continue
 			}
 			if strings.EqualFold("failed", echo.Status) {
-				return nil, fmt.Errorf("action failed, rawdata: %x, please see onebot logs", echo.Status)
+				return nil, fmt.Errorf("action failed, status: %s", echo.Status)
 			}
 			var res R
 			if err := json.Unmarshal(echo.Data, &res); err != nil {
